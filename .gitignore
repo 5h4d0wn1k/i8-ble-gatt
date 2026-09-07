@@ -1,4 +1,15 @@
+# Python artifacts
 __pycache__/
 *.pyc
 *.pyo
+
+# Reports
+reports/
+
+# Captures
+captures/
+*.pcap
+
+# OS noise
 .DS_Store
+Thumbs.db

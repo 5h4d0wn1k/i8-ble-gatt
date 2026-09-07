@@ -112,6 +112,283 @@ def resolve_uuid(uuid_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Wire-level protocol: ATT (Attribute Protocol) PDU parsing
+# ---------------------------------------------------------------------------
+
+ATT_OPCODES: Dict[int, Dict[str, Any]] = {
+    0x01: {"name": "Error Response", "rcv": "req"},
+    0x02: {"name": "Exchange MTU Request", "rcv": "req"},
+    0x03: {"name": "Exchange MTU Response", "rcv": "rsp"},
+    0x04: {"name": "Find Information Request", "rcv": "req"},
+    0x05: {"name": "Find Information Response", "rcv": "rsp"},
+    0x06: {"name": "Find By Type Value Request", "rcv": "req"},
+    0x07: {"name": "Find By Type Value Response", "rcv": "rsp"},
+    0x08: {"name": "Read By Type Request", "rcv": "req"},
+    0x09: {"name": "Read By Type Response", "rcv": "rsp"},
+    0x0a: {"name": "Read Request", "rcv": "req"},
+    0x0b: {"name": "Read Response", "rcv": "rsp"},
+    0x0c: {"name": "Read Blob Request", "rcv": "req"},
+    0x0d: {"name": "Read Blob Response", "rcv": "rsp"},
+    0x0e: {"name": "Read Multiple Request", "rcv": "req"},
+    0x0f: {"name": "Read Multiple Response", "rcv": "rsp"},
+    0x10: {"name": "Read By Group Type Request", "rcv": "req"},
+    0x11: {"name": "Read By Group Type Response", "rcv": "rsp"},
+    0x12: {"name": "Write Request", "rcv": "req"},
+    0x13: {"name": "Write Response", "rcv": "rsp"},
+    0x14: {"name": "Write Command", "rcv": "cmd"},
+    0x15: {"name": "Signed Write Command", "rcv": "cmd"},
+    0x16: {"name": "Prepare Write Request", "rcv": "req"},
+    0x17: {"name": "Prepare Write Response", "rcv": "rsp"},
+    0x18: {"name": "Execute Write Request", "rcv": "req"},
+    0x19: {"name": "Execute Write Response", "rcv": "rsp"},
+    0x1b: {"name": "Handle Value Notification", "rcv": "cmd"},
+    0x1d: {"name": "Handle Value Indication", "rcv": "req"},
+    0x1e: {"name": "Handle Value Confirmation", "rcv": "rsp"},
+}
+
+ATT_ERRORS: Dict[int, str] = {
+    0x01: "Invalid Handle",
+    0x02: "Read Not Permitted",
+    0x03: "Write Not Permitted",
+    0x04: "Invalid PDU",
+    0x05: "Insufficient Authentication",
+    0x06: "Request Not Supported",
+    0x07: "Invalid Offset",
+    0x08: "Insufficient Authorization",
+    0x09: "Prepare Queue Full",
+    0x0a: "Attribute Not Found",
+    0x0b: "Attribute Not Long",
+    0x0c: "Insufficient Encryption Key Size",
+    0x0d: "Invalid Attribute Value Length",
+    0x0e: "Unlikely Error",
+    0x0f: "Insufficient Encryption",
+    0x10: "Unsupported Group Type",
+    0x11: "Insufficient Resources",
+}
+
+GAP_AD_TYPES: Dict[int, str] = {
+    0x01: "Flags",
+    0x02: "Incomplete List of 16-bit Service UUIDs",
+    0x03: "Complete List of 16-bit Service UUIDs",
+    0x04: "Incomplete List of 32-bit Service UUIDs",
+    0x05: "Complete List of 32-bit Service UUIDs",
+    0x06: "Incomplete List of 128-bit Service UUIDs",
+    0x07: "Complete List of 128-bit Service UUIDs",
+    0x08: "Shortened Local Name",
+    0x09: "Complete Local Name",
+    0x0a: "TX Power Level",
+    0x16: "Service Data",
+    0xff: "Manufacturer Specific Data",
+}
+
+ADV_PDU_NAMES: Dict[int, str] = {
+    0x00: "ADV_IND",
+    0x01: "ADV_DIRECT_IND",
+    0x02: "ADV_NONCONN_IND",
+    0x03: "SCAN_REQ",
+    0x04: "SCAN_RSP",
+    0x05: "CONNECT_IND",
+    0x06: "ADV_SCAN_IND",
+}
+
+
+def _le16(b, off):
+    return b[off] | (b[off + 1] << 8)
+
+
+def _uuid_short_label(b: bytes) -> str:
+    """Render a raw LE 2-byte UUID as '0xXXXX'."""
+    if len(b) == 2:
+        return "0x%04x" % _le16(b, 0)
+    return b.hex()
+
+
+def parse_att_pdu(raw: bytes) -> Dict[str, Any]:
+    """Parse a raw ATT protocol data unit into its fields.
+
+    Returns a JSON-safe dict (values are hex strings / ints / lists). Always
+    exposes the opcode, its human-readable name, payload length and whether the
+    PDU expects a response / is a no-response command.
+    """
+    if not raw:
+        raise ValueError("empty ATT PDU")
+    op = raw[0]
+    meta = ATT_OPCODES.get(op, {})
+    rcv = meta.get("rcv", "rsp")
+    out: Dict[str, Any] = {
+        "opcode": op,
+        "opcode_name": meta.get("name", "0x%02x" % op),
+        "length": len(raw),
+        "expects_response": rcv == "req",
+        "is_command": rcv == "cmd",
+    }
+    try:
+        if op == 0x01:  # Error response
+            out.update(
+                req_opcode=raw[1],
+                att_handle=_le16(raw, 2),
+                error=raw[4],
+                error_name=ATT_ERRORS.get(raw[4], "0x%02x" % raw[4]),
+            )
+        elif op == 0x02:
+            out["client_rx_mtu"] = _le16(raw, 1)
+        elif op == 0x03:
+            out["server_rx_mtu"] = _le16(raw, 1)
+        elif op in (0x04,):
+            out.update(start_handle=_le16(raw, 1), end_handle=_le16(raw, 3))
+        elif op == 0x05:  # Find information response
+            fmt = raw[1]
+            step = 4 if fmt == 1 else 18
+            uuids = []
+            for i in range(2, len(raw) - 1, step):
+                uuids.append(_uuid_short_label(raw[i:i + 2]))
+            out.update(format=fmt, uuids=uuids)
+        elif op == 0x06:
+            out.update(
+                start_handle=_le16(raw, 1),
+                end_handle=_le16(raw, 3),
+                type=raw[5:7].hex(),
+                value=raw[7:].hex(),
+            )
+        elif op == 0x07:
+            items = []
+            for i in range(1, len(raw) - 3, 4):
+                items.append({"handle": _le16(raw, i),
+                              "group_end": _le16(raw, i + 2)})
+            out["items"] = items
+        elif op == 0x08:
+            out.update(
+                start_handle=_le16(raw, 1),
+                end_handle=_le16(raw, 3),
+                type=raw[5:].hex(),
+            )
+        elif op == 0x09:  # Read by type response
+            length = raw[1]
+            step = max(2, length)
+            items = []
+            for i in range(2, len(raw) - 1, step):
+                items.append({"handle": _le16(raw, i),
+                              "data": raw[i + 2:i + step].hex()})
+            out.update(pair_length=length, items=items)
+        elif op == 0x0a:
+            out["handle"] = _le16(raw, 1)
+        elif op == 0x0b:
+            out["value"] = raw[1:].hex()
+        elif op == 0x0c:
+            out.update(handle=_le16(raw, 1), offset=_le16(raw, 3))
+        elif op == 0x0d:
+            out["value"] = raw[1:].hex()
+        elif op == 0x0e:
+            out["handles"] = [_le16(raw, i) for i in range(1, len(raw) - 1, 2)]
+        elif op == 0x0f:
+            out["values"] = raw[1:].hex()
+        elif op == 0x10:  # Read by group type request (service discovery)
+            out.update(
+                start_handle=_le16(raw, 1),
+                end_handle=_le16(raw, 3),
+                group_type=raw[5:].hex(),
+            )
+        elif op == 0x11:  # Read by group type response (services)
+            length = raw[1]
+            step = max(2, length)
+            items = []
+            for i in range(2, len(raw) - 1, step):
+                uuid_bytes = raw[i + 4:i + step]
+                short = _uuid_short_label(uuid_bytes)
+                items.append({
+                    "handle": _le16(raw, i),
+                    "group_end": _le16(raw, i + 2),
+                    "uuid_short": short,
+                    "uuid_name": resolve_uuid(short),
+                })
+            out.update(pair_length=length, items=items)
+        elif op == 0x12:  # Write request
+            out.update(handle=_le16(raw, 1), value=raw[3:].hex())
+        elif op == 0x13:
+            out.update(handle=_le16(raw, 1))
+        elif op in (0x14,):  # Write command
+            out.update(handle=_le16(raw, 1), value=raw[3:].hex())
+        elif op == 0x15:  # Signed write command
+            out.update(handle=_le16(raw, 1), signature=raw[3:11].hex(),
+                       value=raw[11:].hex())
+        elif op in (0x16, 0x17):
+            out.update(handle=_le16(raw, 1), offset=_le16(raw, 3),
+                       value=raw[5:].hex())
+        elif op == 0x18:
+            out["operation"] = raw[1]
+        elif op == 0x19:
+            out["flags"] = raw[1]
+        elif op in (0x1b, 0x1d):  # Notification / indication
+            out.update(handle=_le16(raw, 1), value=raw[3:].hex())
+        elif op == 0x1e:
+            out["handle"] = _le16(raw, 1)
+    except IndexError:
+        out["partial"] = True
+    return out
+
+
+def render_att_pdu(pdu: Dict[str, Any]) -> str:
+    """Human-readable one-liner for a parsed ATT PDU."""
+    parts = ["0x%02x %s (len %d)" % (pdu["opcode"], pdu["opcode_name"],
+                                     pdu["length"])]
+    for key in ("handle", "value", "client_rx_mtu", "server_rx_mtu",
+                "start_handle", "end_handle", "type", "group_type",
+                "req_opcode", "error_name"):
+        if key in pdu:
+            parts.append("%s=%s" % (key, pdu[key]))
+    if pdu.get("expects_response"):
+        parts.append("(expects response)")
+    if pdu.get("is_command"):
+        parts.append("(no response)")
+    return " ".join(parts)
+
+
+def parse_adv_packet(raw: bytes) -> Dict[str, Any]:
+    """Parse a raw BLE advertisement (GAP) packet.
+
+    Layout: PDU header byte, 6-byte advertiser address, then AD structures of
+    (length, type, data). JSON-safe output.
+    """
+    if len(raw) < 7:
+        raise ValueError("advertisement packet too short")
+    header = raw[0]
+    pdu_type = header & 0x0f
+    out: Dict[str, Any] = {
+        "pdu_type": pdu_type,
+        "pdu_type_name": ADV_PDU_NAMES.get(pdu_type, "0x%02x" % pdu_type),
+        "tx_address_random": bool((header >> 6) & 1),
+        "rx_address_random": bool((header >> 7) & 1),
+        "adv_addr_hex": raw[1:7].hex(),
+        "ad_fields": [],
+    }
+    local_name = None
+    i = 7
+    while i < len(raw):
+        ln = raw[i]
+        if ln == 0:
+            break
+        if i + 1 + ln > len(raw):
+            break
+        typ = raw[i + 1]
+        data = raw[i + 2:i + 1 + ln]
+        out["ad_fields"].append({
+            "type": typ,
+            "type_name": GAP_AD_TYPES.get(typ, "0x%02x" % typ),
+            "data": data.hex(),
+        })
+        if typ in (0x08, 0x09):
+            try:
+                text = data.decode("utf-8")
+                local_name = text
+            except UnicodeDecodeError:
+                pass
+        i += 1 + ln
+    if local_name is not None:
+        out["local_name"] = local_name
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Sensitive name keywords
 # ---------------------------------------------------------------------------
 
@@ -259,6 +536,96 @@ def load_gatt(path: str) -> GATTProfile:
     except (json.JSONDecodeError, UnicodeDecodeError):
         pass
     return load_csv(path)
+
+
+def profile_from_dict(data: Dict[str, Any]) -> GATTProfile:
+    """Build a GATTProfile from a JSON-like dict."""
+    profile = GATTProfile(
+        device_name=data.get("device_name", "Unknown"),
+        address=data.get("address", "00:00:00:00:00:00"),
+    )
+    for svc in data.get("services", []):
+        chars = [_char_from_dict(c) for c in svc.get("characteristics", [])]
+        profile.services.append(Service(
+            uuid=svc.get("uuid", ""),
+            name=svc.get("name", ""),
+            characteristics=chars,
+        ))
+    return profile
+
+
+def _full_uuid16(short: int) -> str:
+    """Expand a 16-bit UUID to the standard 128-bit base form."""
+    return "0000%04x-0000-1000-8000-00805f9b34fb" % short
+
+
+def _props_from_flags(b: int) -> List[str]:
+    """Decode a characteristic properties byte into the standard names."""
+    props = []
+    if b & 0x01:
+        props.append("broadcast")
+    if b & 0x02:
+        props.append("read")
+    if b & 0x04:
+        props.append("write-without-response")
+    if b & 0x08:
+        props.append("write")
+    if b & 0x10:
+        props.append("notify")
+    if b & 0x20:
+        props.append("indicate")
+    if b & 0x40:
+        props.append("authenticated-signed-writes")
+    if b & 0x80:
+        props.append("extended-properties")
+    return props
+
+
+def build_profile_from_att(pdus: List[bytes]) -> GATTProfile:
+    """Reconstruct a GATTProfile from raw ATT discovery responses.
+
+    Consumes Read By Group Type responses (services) and Read By Type responses
+    (characteristic declarations) in order, mirroring how a client would
+    discover primary services and their characteristics over the wire.
+    """
+    profile = GATTProfile(device_name="WireDiscovery", address="00:00:00:00:00:00")
+    current_service: Optional[Service] = None
+    for raw in pdus:
+        pdu = parse_att_pdu(raw)
+        op = pdu["opcode"]
+        if op == 0x11:
+            for it in pdu.get("items", []):
+                short = int(it["uuid_short"], 16)
+                svc = Service(uuid=_full_uuid16(short),
+                              name=resolve_uuid(it["uuid_short"]))
+                profile.services.append(svc)
+                current_service = svc
+        elif op == 0x09:
+            if current_service is None:
+                continue
+            for it in pdu.get("items", []):
+                data = bytes.fromhex(it["data"])
+                if len(data) < 4:  # props(1) + value handle(2) + uuid(>=2)
+                    continue
+                props_byte = data[0]
+                uuid_bytes = data[3:]
+                if len(uuid_bytes) == 2:
+                    short = _le16(uuid_bytes, 0)
+                    full = _full_uuid16(short)
+                else:
+                    full = "-".join([
+                        uuid_bytes.hex()[:8],
+                        uuid_bytes.hex()[8:12],
+                        uuid_bytes.hex()[12:16],
+                        uuid_bytes.hex()[16:20],
+                        uuid_bytes.hex()[20:32],
+                    ])
+                current_service.characteristics.append(Characteristic(
+                    uuid=full,
+                    name=resolve_uuid(full),
+                    properties=_props_from_flags(props_byte),
+                ))
+    return profile
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +907,28 @@ def export_csv(findings: List[Finding], path: str) -> None:
 # Bundled sample data for offline demo
 # ---------------------------------------------------------------------------
 
+# Raw ATT PDUs for the demo (hex): MTU exchange, write request, notification,
+# error response.
+DEMO_ATT_PDUS: List[str] = [
+    "02f800",              # Exchange MTU Request, client rx MTU 248
+    "122300616300",        # Write Request to handle 0x0023, value "ac\x00"
+    "1b24002a00",          # Handle Value Notification, handle 0x0024, b"\x2a"
+    "010823000a",          # Error Response: Attribute Not Found (0x0a)
+]
+
+# Raw ATT discovery trace used to reconstruct a wire profile:
+#  - Read By Group Type Response: service handle 1, group end 11, UUID 0x180f
+#  - Read By Type Response: handle 2, properties Read, value handle 3,
+#                           UUID 0x2a19 (Battery Level)
+DEMO_ATT_DISCOVERY: List[str] = [
+    "110601000b000f18",
+    "09070200020300192a",
+]
+
+# Raw BLE advertisement: ADV_IND, adv addr aabbccddeeff (masked), the Flags AD
+# structure and a Complete Local Name AD structure ("DemoTest").
+DEMO_ADV: str = "00112233445566020106090944656d6f54657374"
+
 DEMO_GATT: Dict[str, Any] = {
     "device_name": "DemoFitnessTracker",
     "address": "AA:BB:CC:DD:EE:FF",
@@ -666,8 +1055,128 @@ DEMO_GATT: Dict[str, Any] = {
 # Main entry point
 # ---------------------------------------------------------------------------
 
-async def _async_main() -> int:
-    """Async main used when live BLE scanning is requested."""
+# ---------------------------------------------------------------------------
+# JSON report writer
+# ---------------------------------------------------------------------------
+
+def _report_dict(profile: GATTProfile, findings: List[Finding]) -> Dict[str, Any]:
+    total_chars = sum(len(s.characteristics) for s in profile.services)
+    total_score = sum(f.risk_score for f in findings)
+    max_possible = len(findings) * 100 if findings else 1
+    return {
+        "tool": "i8-ble-gatt",
+        "device_name": profile.device_name,
+        "address": profile.address,
+        "service_count": len(profile.services),
+        "characteristic_count": total_chars,
+        "services": [
+            {
+                "uuid": s.uuid,
+                "name": s.name,
+                "characteristics": [
+                    {"uuid": c.uuid, "name": c.name,
+                     "properties": c.properties, "descriptors": c.descriptors}
+                    for c in s.characteristics
+                ],
+            } for s in profile.services
+        ],
+        "findings": [
+            {"severity": f.severity, "category": f.category,
+             "risk_score": f.risk_score, "service_uuid": f.service_uuid,
+             "char_uuid": f.char_uuid, "message": f.message}
+            for f in findings
+        ],
+        "risk_score_total": total_score,
+        "risk_score_percent": round(float(total_score) / max_possible * 100, 1),
+    }
+
+
+def _write_json_report(profile: GATTProfile, findings: List[Finding],
+                       report_dir: str, filename: str) -> str:
+    os.makedirs(report_dir, exist_ok=True)
+    path = os.path.join(report_dir, filename)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(_report_dict(profile, findings), fh, indent=2)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Offline demo
+# ---------------------------------------------------------------------------
+
+def run_demo(report_dir: str = "reports", print_report: bool = True) -> int:
+    """Offline demo: bundled GATT assessment, wire-level ATT/ADV parses and a
+    wire-discovery reconstruction. Writes reports/i8_demo_report.json and
+    returns 0."""
+    os.makedirs(report_dir, exist_ok=True)
+    profile = profile_from_dict(DEMO_GATT)
+    findings = assess(profile)
+
+    if print_report:
+        print("=== I8 - BLE GATT Security Assessment ===")
+        print("[mode] demo (bundled sample data + wire-level ATT/ADV)")
+        print("")
+        print(generate_report(profile, findings))
+
+    print("")
+    print("-- Wire-level ATT PDU parses --")
+    att_parses = []
+    for h in DEMO_ATT_PDUS:
+        pdu = parse_att_pdu(bytes.fromhex(h))
+        att_parses.append(pdu)
+        print("  0x%02x %-30s %s" % (pdu["opcode"], render_att_pdu(pdu), h))
+
+    adv = parse_adv_packet(bytes.fromhex(DEMO_ADV))
+    print("")
+    print("- advertisement: %s, addr=%s, name=%s" % (
+        adv["pdu_type_name"], adv["adv_addr_hex"],
+        adv.get("local_name", "?")))
+
+    wire_profile = build_profile_from_att([bytes.fromhex(x)
+                                           for x in DEMO_ATT_DISCOVERY])
+    wire_findings = assess(wire_profile)
+    print("- wire discovery: %d service(s), %d characteristic(s)" % (
+        len(wire_profile.services),
+        sum(len(s.characteristics) for s in wire_profile.services)))
+    for svc in wire_profile.services:
+        for ch in svc.characteristics:
+            print("  %s / %s  props=[%s]" % (
+                svc.name, ch.name, ", ".join(ch.properties)))
+
+    data = _report_dict(profile, findings)
+    data["att_parses"] = [
+        {"pdu": h, "opcode": p["opcode"], "opcode_name": p["opcode_name"]}
+        for h, p in zip(DEMO_ATT_PDUS, att_parses)
+    ]
+    data["advertisement"] = adv
+    data["wire_discovered_services"] = len(wire_profile.services)
+    data["wire_discovered_characteristics"] = sum(
+        len(s.characteristics) for s in wire_profile.services)
+    data["wire_findings"] = [
+        {"severity": f.severity, "category": f.category, "message": f.message}
+        for f in wire_findings
+    ]
+    data["att_round_trip"] = all(
+        parse_att_pdu(bytes.fromhex(h))["opcode"] == p["opcode"]
+        for h, p in zip(DEMO_ATT_PDUS, att_parses))
+    data["demo_exit"] = 0
+
+    json_path = os.path.join(report_dir, "i8_demo_report.json")
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    if print_report:
+        print("")
+        print("[+] Report: %s" % json_path)
+        print("[+] Demo complete - exit 0")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def build_parser() -> "argparse.ArgumentParser":
+    """Shared argument parser for sync and async paths."""
     import argparse
     parser = argparse.ArgumentParser(
         description="I8 - BLE GATT Security Assessment Toolkit",
@@ -680,100 +1189,93 @@ async def _async_main() -> int:
                         help="Scan timeout in seconds (default: 10)")
     parser.add_argument("--csv", default=None,
                         help="Export findings to CSV file")
-    args = parser.parse_args()
+    parser.add_argument("--demo", action="store_true",
+                        help="Run offline demo (bundled GATT + wire-level "
+                             "ATT/ADV parses), write reports/i8_demo_report.json, exit 0")
+    parser.add_argument("--att", default=None, metavar="HEX",
+                        help="Parse a raw ATT protocol data unit from hex")
+    parser.add_argument("--adv", default=None, metavar="HEX",
+                        help="Parse a raw BLE advertisement (GAP) packet from hex")
+    parser.add_argument("--json", action="store_true",
+                        help="Write JSON report to --report-dir")
+    parser.add_argument("--report-dir", default="reports",
+                        help="Directory for JSON reports (default: reports)")
+    return parser
 
+
+def _run_assessment(profile: GATTProfile, args: Any) -> int:
+    findings = assess(profile)
+    print("")
+    print(generate_report(profile, findings))
+    if args.csv:
+        export_csv(findings, args.csv)
+        print("Findings exported to %s" % args.csv)
+    if args.json:
+        path = _write_json_report(profile, findings, args.report_dir,
+                                  "i8_gatt_report.json")
+        print("Report written to %s" % path)
+    return 0
+
+
+async def _async_main(args: Any) -> int:
+    """Async path used when a live BLE scan is requested."""
     print("=== I8 - BLE GATT Security Assessment ===")
+    addr = args.live or None
+    print("[mode] live BLE scan")
+    if not HAVE_BLEAK:
+        print("[!] bleak is not installed. Run: pip install bleak")
+        print("[!] Falling back to demo mode.")
+        profile = profile_from_dict(DEMO_GATT)
+    else:
+        profile = await _scan_live(address=addr, timeout=args.timeout)
+    return _run_assessment(profile, args)
 
-    if args.live is not None:
-        addr = args.live if args.live else None
-        print("[mode] live BLE scan")
-        if not HAVE_BLEAK:
-            print("[!] bleak is not installed. Run: pip install bleak")
-            print("[!] Falling back to demo mode.")
-            profile = GATTProfile()
-            for svc in DEMO_GATT["services"]:
-                chars = [_char_from_dict(c) for c in svc.get("characteristics", [])]
-                profile.services.append(Service(
-                    uuid=svc["uuid"], name=svc["name"], characteristics=chars,
-                ))
-            profile.device_name = DEMO_GATT["device_name"]
-            profile.address = DEMO_GATT["address"]
-        else:
-            profile = await _scan_live(address=addr, timeout=args.timeout)
-    elif args.input_file:
+
+def _file_or_demo(args: Any) -> int:
+    print("=== I8 - BLE GATT Security Assessment ===")
+    if args.input_file:
         print("[mode] file (%s)" % args.input_file)
         profile = load_gatt(args.input_file)
     else:
         print("[mode] demo (bundled sample data)")
-        profile = GATTProfile()
-        for svc in DEMO_GATT["services"]:
-            chars = [_char_from_dict(c) for c in svc.get("characteristics", [])]
-            profile.services.append(Service(
-                uuid=svc["uuid"], name=svc["name"], characteristics=chars,
-            ))
-        profile.device_name = DEMO_GATT["device_name"]
-        profile.address = DEMO_GATT["address"]
-
-    print("")
-    findings = assess(profile)
-    report = generate_report(profile, findings)
-    print(report)
-
-    if args.csv:
-        export_csv(findings, args.csv)
-        print("Findings exported to %s" % args.csv)
-
-    return 0
+        profile = profile_from_dict(DEMO_GATT)
+    return _run_assessment(profile, args)
 
 
 def main() -> int:
     """Synchronous entry point that handles async BLE scanning if needed."""
-    # Quick check: if --live is in args, we need async
-    if "--live" in sys.argv:
-        import asyncio
-        return asyncio.run(_async_main())
-    else:
-        # Parse args synchronously for file/demo modes
-        import argparse
-        parser = argparse.ArgumentParser(
-            description="I8 - BLE GATT Security Assessment Toolkit",
-        )
-        parser.add_argument("input_file", nargs="?", default=None,
-                            help="Path to JSON or CSV GATT dump")
-        parser.add_argument("--live", nargs="?", const="", default=None,
-                            help="Live BLE scan (requires bleak)")
-        parser.add_argument("--timeout", type=float, default=10.0,
-                            help="Scan timeout in seconds (default: 10)")
-        parser.add_argument("--csv", default=None,
-                            help="Export findings to CSV file")
-        args = parser.parse_args()
+    import argparse
+    parser = build_parser()
+    args = parser.parse_args()
 
-        print("=== I8 - BLE GATT Security Assessment ===")
-
-        if args.input_file:
-            print("[mode] file (%s)" % args.input_file)
-            profile = load_gatt(args.input_file)
-        else:
-            print("[mode] demo (bundled sample data)")
-            profile = GATTProfile()
-            for svc in DEMO_GATT["services"]:
-                chars = [_char_from_dict(c) for c in svc.get("characteristics", [])]
-                profile.services.append(Service(
-                    uuid=svc["uuid"], name=svc["name"], characteristics=chars,
-                ))
-            profile.device_name = DEMO_GATT["device_name"]
-            profile.address = DEMO_GATT["address"]
-
-        print("")
-        findings = assess(profile)
-        report = generate_report(profile, findings)
-        print(report)
-
-        if args.csv:
-            export_csv(findings, args.csv)
-            print("Findings exported to %s" % args.csv)
-
+    if args.att is not None:
+        try:
+            raw = bytes.fromhex(args.att)
+        except ValueError:
+            print("error: invalid hex for --att")
+            return 2
+        pdu = parse_att_pdu(raw)
+        print(render_att_pdu(pdu))
         return 0
+
+    if args.adv is not None:
+        try:
+            raw = bytes.fromhex(args.adv)
+        except ValueError:
+            print("error: invalid hex for --adv")
+            return 2
+        adv = parse_adv_packet(raw)
+        print(json.dumps(adv, indent=2))
+        return 0
+
+    if args.demo:
+        return run_demo(args.report_dir, print_report=not args.json)
+
+    if args.live is not None:
+        import asyncio
+        return asyncio.run(_async_main(args))
+
+    return _file_or_demo(args)
 
 
 if __name__ == "__main__":
